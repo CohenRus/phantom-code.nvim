@@ -1,0 +1,326 @@
+local M = {}
+local common = require 'phantom-code.backends.common'
+local utils = require 'phantom-code.utils'
+local Job = require 'plenary.job'
+
+function M.openai_get_text_fn_no_stream(json)
+    return json.choices[1].message.content
+end
+
+function M.openai_get_text_fn_stream(json)
+    return json.choices[1].delta.content
+end
+
+---@class phantom-code.InlineCompleteOpts
+---@field cancel_existing? boolean If false, do not kill other inline jobs (default true).
+---@field job_pool? 'inline'|'expand' Job registry (default inline).
+---@field provider_options? table Merged options for this request.
+
+--- One-shot chat: `messages` is the full OpenAI-style list (e.g. system + user). No few-shots merge, no `<endCompletion>` split.
+---@param options table Merged provider options (api_key, model, …)
+---@param messages { role: string, content: string }[]
+---@param callback fun(text: string?)
+---@param request_opts? { max_time?: number, cancel_existing_expand_jobs?: boolean, expand_session_id?: integer }
+function M.expand_openai_chat(options, messages, callback, request_opts)
+    request_opts = request_opts or {}
+    local config = require('phantom-code').config
+
+    if request_opts.cancel_existing_expand_jobs ~= false then
+        common.terminate_expand_jobs()
+    end
+
+    local data = {
+        model = options.model,
+        messages = messages,
+        stream = options.stream,
+    }
+
+    data = vim.tbl_deep_extend('force', data, options.optional or {})
+
+    local headers = {
+        ['Content-Type'] = 'application/json',
+        ['Authorization'] = 'Bearer ' .. utils.get_api_key(options.api_key),
+    }
+    local transformed_data = common.apply_transforms(options.transform, options.end_point, headers, data)
+
+    local data_file = utils.make_tmp_file(transformed_data.body)
+
+    if data_file == nil then
+        callback()
+        return
+    end
+
+    local args =
+        utils.make_curl_args(transformed_data.end_point, transformed_data.headers, data_file, request_opts.max_time)
+
+    local provider_name = 'openai_compatible'
+    local timestamp = os.time()
+
+    utils.run_event('PhantomCodeRequestStartedPre', {
+        provider = provider_name,
+        name = options.name,
+        model = options.model,
+        n_requests = 1,
+        timestamp = timestamp,
+    })
+
+    local new_job = Job:new {
+        command = config.curl_cmd,
+        args = args,
+        on_exit = vim.schedule_wrap(function(job, exit_code)
+            common.remove_job(job)
+
+            utils.run_event('PhantomCodeRequestFinished', {
+                provider = provider_name,
+                model = options.model,
+                name = options.name,
+                n_requests = 1,
+                request_idx = 1,
+                timestamp = timestamp,
+            })
+
+            local items_raw
+
+            if options.stream then
+                items_raw = utils.stream_decode(job, exit_code, data_file, options.name, M.openai_get_text_fn_stream)
+            else
+                items_raw =
+                    utils.no_stream_decode(job, exit_code, data_file, options.name, M.openai_get_text_fn_no_stream)
+            end
+
+            if not items_raw then
+                callback()
+                return
+            end
+
+            callback(items_raw)
+        end),
+    }
+
+    common.register_job(new_job, 'expand', request_opts.expand_session_id)
+    new_job:start()
+
+    utils.run_event('PhantomCodeRequestStarted', {
+        provider = provider_name,
+        name = options.name,
+        model = options.model,
+        n_requests = 1,
+        request_idx = 1,
+        timestamp = timestamp,
+    })
+end
+
+---@param options table
+---@param context table
+---@param callback fun(items: string[]?)
+---@param inline_opts? phantom-code.InlineCompleteOpts
+function M.complete_openai_base(options, context, callback, inline_opts)
+    inline_opts = inline_opts or {}
+    local config = require('phantom-code').config
+
+    if inline_opts.cancel_existing ~= false then
+        common.terminate_all_jobs()
+    end
+
+    local ctx = utils.make_chat_llm_shot(context, options.chat_input)
+    ctx = common.create_chat_messages_from_list(ctx)
+
+    local few_shots = vim.deepcopy(utils.get_or_eval_value(options.few_shots))
+
+    local system = utils.make_system_prompt(options.system, utils.INLINE_N_COMPLETIONS)
+
+    table.insert(few_shots, 1, { role = 'system', content = system })
+    vim.list_extend(few_shots, ctx)
+
+    local data = {
+        model = options.model,
+        messages = few_shots,
+        stream = options.stream,
+    }
+
+    data = vim.tbl_deep_extend('force', data, options.optional or {})
+
+    local headers = {
+        ['Content-Type'] = 'application/json',
+        ['Authorization'] = 'Bearer ' .. utils.get_api_key(options.api_key),
+    }
+    local transformed_data = common.apply_transforms(options.transform, options.end_point, headers, data)
+
+    local data_file = utils.make_tmp_file(transformed_data.body)
+
+    if data_file == nil then
+        callback()
+        return
+    end
+
+    local args = utils.make_curl_args(transformed_data.end_point, transformed_data.headers, data_file)
+
+    local provider_name = 'openai_compatible'
+    local timestamp = os.time()
+
+    utils.run_event('PhantomCodeRequestStartedPre', {
+        provider = provider_name,
+        name = options.name,
+        model = options.model,
+        n_requests = 1,
+        timestamp = timestamp,
+    })
+
+    local new_job = Job:new {
+        command = config.curl_cmd,
+        args = args,
+        on_exit = vim.schedule_wrap(function(job, exit_code)
+            common.remove_job(job)
+
+            utils.run_event('PhantomCodeRequestFinished', {
+                provider = provider_name,
+                model = options.model,
+                name = options.name,
+                n_requests = 1,
+                request_idx = 1,
+                timestamp = timestamp,
+            })
+
+            local items_raw
+
+            if options.stream then
+                items_raw = utils.stream_decode(job, exit_code, data_file, options.name, M.openai_get_text_fn_stream)
+            else
+                items_raw =
+                    utils.no_stream_decode(job, exit_code, data_file, options.name, M.openai_get_text_fn_no_stream)
+            end
+
+            if not items_raw then
+                callback()
+                return
+            end
+
+            local items = common.parse_completion_items(items_raw, options.name)
+
+            items = common.filter_context_sequences_in_items(items, context)
+
+            items = utils.remove_spaces(items)
+            items = utils.limit_inline_completion_items(items)
+
+            callback(items)
+        end),
+    }
+
+    common.register_job(new_job, inline_opts.job_pool)
+    new_job:start()
+
+    utils.run_event('PhantomCodeRequestStarted', {
+        provider = provider_name,
+        name = options.name,
+        model = options.model,
+        n_requests = 1,
+        request_idx = 1,
+        timestamp = timestamp,
+    })
+end
+
+---@param inline_opts? phantom-code.InlineCompleteOpts
+function M.complete_openai_fim_base(options, get_text_fn, context, callback, inline_opts)
+    inline_opts = inline_opts or {}
+    local config = require('phantom-code').config
+
+    if inline_opts.cancel_existing ~= false then
+        common.terminate_all_jobs()
+    end
+
+    local data = {}
+
+    data.model = options.model
+    data.stream = options.stream
+    local context_before_cursor = context.lines_before
+    local context_after_cursor = context.lines_after
+    local opts = context.opts
+
+    data = vim.tbl_deep_extend('force', data, options.optional or {})
+
+    data.prompt = options.template.prompt(context_before_cursor, context_after_cursor, opts)
+    data.suffix = options.template.suffix and options.template.suffix(context_before_cursor, context_after_cursor, opts)
+        or nil
+
+    local end_point = options.end_point
+    local headers = {
+        ['Content-Type'] = 'application/json',
+        ['Accept'] = 'application/json',
+        ['Authorization'] = 'Bearer ' .. utils.get_api_key(options.api_key),
+    }
+
+    local transformed_data = common.apply_transforms(options.transform, end_point, headers, data)
+
+    local data_file = utils.make_tmp_file(transformed_data.body)
+
+    if data_file == nil then
+        callback()
+        return
+    end
+
+    local args = utils.make_curl_args(transformed_data.end_point, transformed_data.headers, data_file)
+
+    local items = {}
+    local n_completions = utils.INLINE_N_COMPLETIONS
+
+    local provider_name = 'openai_fim_compatible'
+    local timestamp = os.time()
+
+    utils.run_event('PhantomCodeRequestStartedPre', {
+        provider = provider_name,
+        name = options.name,
+        model = options.model,
+        n_requests = n_completions,
+        timestamp = timestamp,
+    })
+
+    for idx = 1, n_completions do
+        local new_job = Job:new {
+            command = config.curl_cmd,
+            args = args,
+            on_exit = vim.schedule_wrap(function(job, exit_code)
+                common.remove_job(job)
+
+                utils.run_event('PhantomCodeRequestFinished', {
+                    provider = provider_name,
+                    name = options.name,
+                    model = options.model,
+                    n_requests = n_completions,
+                    request_idx = idx,
+                    timestamp = timestamp,
+                })
+
+                local result
+
+                if options.stream then
+                    result = utils.stream_decode(job, exit_code, data_file, options.name, get_text_fn)
+                else
+                    result = utils.no_stream_decode(job, exit_code, data_file, options.name, get_text_fn)
+                end
+
+                if result then
+                    table.insert(items, result)
+                end
+
+                items = common.filter_context_sequences_in_items(items, context)
+                items = utils.remove_spaces(items, true)
+
+                callback(items)
+            end),
+        }
+
+        common.register_job(new_job, inline_opts.job_pool)
+        new_job:start()
+
+        utils.run_event('PhantomCodeRequestStarted', {
+            provider = provider_name,
+            name = options.name,
+            model = options.model,
+            n_requests = n_completions,
+            request_idx = idx,
+            timestamp = timestamp,
+        })
+    end
+end
+
+return M

@@ -1,0 +1,4 @@
+.claude/
+nvim.log
+*.log
+temp.cpp
