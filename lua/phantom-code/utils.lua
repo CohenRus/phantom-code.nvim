@@ -70,9 +70,10 @@ function M.make_tmp_file(content)
         return
     end
 
-    local result, json = pcall(vim.json.encode, content)
-
-    if not result then
+    local ok, json = pcall(vim.json.encode, content)
+    if not ok then
+        f:close()
+        os.remove(tmp_file)
         M.notify('Failed to encode completion request data', 'error', vim.log.levels.ERROR)
         return
     end
@@ -241,6 +242,19 @@ end
 --- @field cursor number[]
 --- @field bufnr number|nil
 
+--- True when virtual-text auto-trigger is enabled for the buffer. The blink.cmp phantom source
+--- reports disabled in this case so only one inline UI runs at a time.
+---@param bufnr? integer
+---@return boolean
+function M.virtual_text_auto_active(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    if bufnr == 0 or not vim.api.nvim_buf_is_valid(bufnr) then
+        return false
+    end
+    local ok, v = pcall(vim.api.nvim_buf_get_var, bufnr, 'phantom_code_virtual_text_auto_trigger')
+    return ok and v == true
+end
+
 ---@param blink_context phantom-code.BlinkCmpContext?
 function M.make_cmp_context(blink_context)
     local self = {}
@@ -264,6 +278,39 @@ function M.make_cmp_context(blink_context)
     return self
 end
 
+--- Human-readable key name for float footers (Neovim footers mangle raw `<…>`; `keytrans` can emit `<lt>…>`).
+---@param lhs string|nil
+---@return string
+function M.keymap_footer_label(lhs)
+    if not lhs or lhs == '' then
+        return '—'
+    end
+    local aliases = {
+        ['<CR>'] = 'Enter',
+        ['<C-CR>'] = 'Ctrl+Enter',
+        ['<S-CR>'] = 'Shift+Enter',
+        ['<M-CR>'] = 'Alt+Enter',
+        ['<Esc>'] = 'Esc',
+        ['<Tab>'] = 'Tab',
+        ['<S-Tab>'] = 'Shift+Tab',
+        ['<C-s>'] = 'Ctrl+S',
+        ['<C-Space>'] = 'Ctrl+Space',
+    }
+    if aliases[lhs] then
+        return aliases[lhs]
+    end
+    if vim.fn.has 'nvim-0.9' == 1 then
+        local ok, t = pcall(vim.fn.keytrans, lhs)
+        if ok and type(t) == 'string' and t ~= '' then
+            t = t:gsub('<[lL][tT]>', '<'):gsub('\\', '')
+            if vim.fn.strdisplaywidth(t) <= 24 then
+                return t
+            end
+        end
+    end
+    return (lhs:gsub('^<(.*)>$', '%1'):gsub('<', ''):gsub('>', ''))
+end
+
 --- Get the context around the cursor position for code completion
 ---@param cmp_context table The completion context object containing cursor position and line info
 ---@return table Context information with the following fields:
@@ -273,53 +320,71 @@ end
 ---     - is_incomplete_before: boolean - True if content before cursor was truncated
 ---     - is_incomplete_after: boolean - True if content after cursor was truncated
 function M.get_context(cmp_context)
+    cmp_context = cmp_context or {}
     local config = require('phantom-code').config
+    local api = vim.api
+    local bufnr = cmp_context.bufnr or api.nvim_get_current_buf()
+    if not api.nvim_buf_is_valid(bufnr) then
+        return {
+            lines_before = '',
+            lines_after = '',
+            opts = { is_incomplete_before = true, is_incomplete_after = true },
+        }
+    end
 
-    local cursor = cmp_context.cursor
+    local cursor = cmp_context.cursor or {}
     local line = cursor.line
     if line == nil and cursor.row ~= nil then
         line = cursor.row - 1
     end
     line = line or 0
 
-    local bufnr = cmp_context.bufnr or vim.api.nvim_get_current_buf()
-    local lines_before_list = vim.api.nvim_buf_get_lines(bufnr, 0, line, false)
-    local lines_after_list = vim.api.nvim_buf_get_lines(bufnr, line + 1, -1, false)
+    local approx_chars_per_line = 80
+    local side_char_budget = math.max(512, math.floor((config.context_window or 16000) / 2))
+    local max_side_lines = math.max(64, math.min(2048, math.ceil(side_char_budget / approx_chars_per_line)))
+    local max_before_lines = math.min(line, max_side_lines)
+    local start_before = line - max_before_lines
+    local lines_before_list = api.nvim_buf_get_lines(bufnr, start_before, line, false)
+    local line_count = api.nvim_buf_line_count(bufnr)
+    local after_count = line_count - line - 1
+    local max_lines_after = math.min(math.max(after_count, 0), max_side_lines)
+    local lines_after_list = api.nvim_buf_get_lines(bufnr, line + 1, line + 1 + max_lines_after, false)
 
     local lines_before = table.concat(lines_before_list, '\n')
     local lines_after = table.concat(lines_after_list, '\n')
 
-    lines_before = lines_before .. '\n' .. cmp_context.cursor_before_line
-    lines_after = cmp_context.cursor_after_line .. '\n' .. lines_after
+    lines_before = lines_before .. '\n' .. (cmp_context.cursor_before_line or '')
+    lines_after = (cmp_context.cursor_after_line or '') .. '\n' .. lines_after
 
     local n_chars_before = vim.fn.strchars(lines_before)
     local n_chars_after = vim.fn.strchars(lines_after)
+    local context_ratio = config.context_ratio or 0.75
 
     local opts = {
-        is_incomplete_before = false,
-        is_incomplete_after = false,
+        is_incomplete_before = start_before > 0,
+        is_incomplete_after = (line + 1 + max_lines_after) < line_count,
     }
 
-    if n_chars_before + n_chars_after > config.context_window then
+    local context_window = config.context_window or 16000
+    if n_chars_before + n_chars_after > context_window then
         -- use some heuristic to decide the context length of before cursor and after cursor
-        if n_chars_before < config.context_window * config.context_ratio then
+        if n_chars_before < context_window * context_ratio then
             -- If the context length before cursor does not exceed the maximum
             -- size, we include the full content before the cursor.
-            lines_after = vim.fn.strcharpart(lines_after, 0, config.context_window - n_chars_before)
+            lines_after = vim.fn.strcharpart(lines_after, 0, context_window - n_chars_before)
             opts.is_incomplete_after = true
-        elseif n_chars_after < config.context_window * (1 - config.context_ratio) then
+        elseif n_chars_after < context_window * (1 - context_ratio) then
             -- if the context length after cursor does not exceed the maximum
             -- size, we include the full content after the cursor.
-            lines_before = vim.fn.strcharpart(lines_before, n_chars_before + n_chars_after - config.context_window)
+            lines_before = vim.fn.strcharpart(lines_before, n_chars_before + n_chars_after - context_window)
             opts.is_incomplete_before = true
         else
             -- at the middle of the file, use the context_ratio to determine the allocation
-            lines_after =
-                vim.fn.strcharpart(lines_after, 0, math.floor(config.context_window * (1 - config.context_ratio)))
+            lines_after = vim.fn.strcharpart(lines_after, 0, math.floor(context_window * (1 - context_ratio)))
 
             lines_before = vim.fn.strcharpart(
                 lines_before,
-                n_chars_before - math.floor(config.context_window * config.context_ratio)
+                n_chars_before - math.floor(context_window * context_ratio)
             )
 
             opts.is_incomplete_before = true
@@ -406,6 +471,7 @@ function M.build_diagnostics_context(bufnr, cursor_row_1, cfg)
     end
 
     local lines = {}
+    local used_chars = 0
     for _, d in ipairs(filtered) do
         local lnum1 = (d.lnum or 0) + 1
         local col1 = (d.col or 0) + 1
@@ -413,13 +479,14 @@ function M.build_diagnostics_context(bufnr, cursor_row_1, cfg)
         msg = msg:gsub('[\r\n]+', ' '):gsub('%s+', ' ')
         msg = vim.fn.strcharpart(msg, 0, DIAG_MESSAGE_CHARS)
         local line = string.format('%s:%d:%d [%s] %s', path, lnum1, col1, diagnostic_severity_name(d.severity), msg)
-        local candidate = #lines == 0 and line or (table.concat(lines, '\n') .. '\n' .. line)
-        if vim.fn.strchars(candidate) <= max_chars then
+        local add = vim.fn.strchars(line) + (#lines > 0 and 1 or 0)
+        if used_chars + add <= max_chars then
             table.insert(lines, line)
-        elseif #lines == 0 then
-            table.insert(lines, vim.fn.strcharpart(line, 0, math.max(32, max_chars - 24)) .. ' …')
-        end
-        if vim.fn.strchars(candidate) > max_chars then
+            used_chars = used_chars + add
+        else
+            if #lines == 0 then
+                table.insert(lines, vim.fn.strcharpart(line, 0, math.max(32, max_chars - 24)) .. ' …')
+            end
             break
         end
     end
@@ -459,7 +526,50 @@ function M.apply_diagnostics_context(context, cmp_context)
         M.build_diagnostics_context(bufnr, cursor_row_1, config.diagnostics or {})
 end
 
---- Add diagnostics and user `context_enrich` to LLM context.
+--- Expand / Expand ask prompt floats (`b:phantom_code_expand_prompt`): skip phantom inline ghost text and LLM blink source.
+---@param bufnr? integer
+---@return boolean
+function M.is_expand_prompt_buffer(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    local ok, v = pcall(vim.api.nvim_buf_get_var, bufnr, 'phantom_code_expand_prompt')
+    return ok and v == true
+end
+
+--- Optional inline request skip (off unless `inline.request_gating` enables flags). Always skips on expand prompt buffers.
+---@param cmp_context table
+---@return boolean
+function M.should_skip_inline_request(cmp_context)
+    cmp_context = cmp_context or {}
+    local api = vim.api
+    local bufnr = cmp_context.bufnr or api.nvim_get_current_buf()
+    if not api.nvim_buf_is_valid(bufnr) then
+        return true
+    end
+    local bt = vim.bo[bufnr].buftype
+    if bt ~= '' or not vim.bo[bufnr].modifiable then
+        return true
+    end
+    if M.is_expand_prompt_buffer(bufnr) then
+        return true
+    end
+    local config = require('phantom-code').config
+    local g = (config.inline or {}).request_gating or {}
+    if not g.skip_consecutive_empty_lines then
+        return false
+    end
+    local row0 = cmp_context.cursor and cmp_context.cursor.line
+    if row0 == nil and cmp_context.cursor and cmp_context.cursor.row then
+        row0 = cmp_context.cursor.row - 1
+    end
+    row0 = row0 or 0
+    local prev_line = (api.nvim_buf_get_lines(bufnr, math.max(0, row0 - 1), row0, false) or {})[1] or ''
+    local cur_line = cmp_context.cursor_line or ''
+    if cur_line:match '^%s*$' and prev_line:match '^%s*$' then
+        return true
+    end
+    return false
+end
+
 ---@param context { lines_before: string, lines_after: string, opts: table }
 ---@param cmp_context table|nil
 ---@return table
@@ -471,6 +581,14 @@ function M.enrich_llm_context(context, cmp_context)
 
     local config = require('phantom-code').config
     local inline = config.inline or {}
+    local icfg = inline.import_context or {}
+    if icfg.enable ~= false then
+        local ok, ctxmod = pcall(require, 'phantom-code.context')
+        if ok and ctxmod.attach_import_snippets then
+            ctxmod.attach_import_snippets(context, cmp_context or {})
+        end
+    end
+
     if type(inline.context_enrich) == 'function' then
         local out = inline.context_enrich(context, cmp_context or {})
         if out ~= nil then

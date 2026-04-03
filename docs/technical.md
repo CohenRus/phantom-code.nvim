@@ -19,10 +19,13 @@ User types in insert mode
   blink M:get_completions()       ← called by blink-cmp's source protocol
         │
         ▼
+utils.should_skip_inline_request()   ← optional request_gating (e.g. consecutive empty lines)
+        │
+        ▼
 utils.resolve_provider_config('inline')  ← optional inline.provider / provider_options / prompt_overrides
 utils.make_cmp_context()          ← snapshot cursor position and current line
 utils.get_context()               ← slice buffer text into prefix + suffix
-utils.enrich_llm_context()        ← apply_diagnostics_context + context_enrich hook
+utils.enrich_llm_context()        ← diagnostics + import_context.attach_import_snippets + context_enrich hook
         │
         ▼
 backends/<provider>.complete(context, callback, inline_opts)
@@ -40,28 +43,121 @@ common.filter_context_sequences_in_items() ← trim completions that duplicate e
 callback(items)                   ← delivered to virtualtext or blink source
 ```
 
-### Expand (visual selection + instruction)
+**Virtual text vs blink:** `utils.virtual_text_auto_active(bufnr)` is true when `vim.b.phantom_code_virtual_text_auto_trigger` is set (typically via `inline.virtualtext.auto_trigger_ft`). The blink.cmp source’s `enabled()` returns **false** on those buffers so automatic inline uses **either** built-in ghost text **or** blink’s phantom provider, not both. `CursorMovedI` restarts the debounced `schedule()` at most once per `inline.cursor_moved_throttle_ms` (InsertEnter still calls `schedule()` immediately).
+
+### Expand (selection or cursor + instruction)
 
 ```
-expand.invoke()                   ← visual marks '< '>, vim.ui.input
+expand.invoke() / invoke_ask()    ← visual marks, last visual, or normal-mode cursor (empty selection = generate)
+        │
+        ▼
+expand_context_refs.resolve_instruction()  ← strip @file: / @symbol:, build referenced XML for template
         │
         ▼
 utils.get_expand_file_surround()  ← context before/after selection (expand.context_window)
 utils.build_diagnostics_context()  ← anchor = start line of selection; cfg = merge(diagnostics, expand.diagnostics)
+fill_user_template(expand.user_template | user_template_ask)
         │
         ▼
 utils.resolve_provider_config('expand')
-backends/<chat>.expand_chat(...)   ← one-shot messages; no few_shots from inline templates
+backends/<chat>.expand_chat(...)   ← implement: system + few_shots + implement_messages[] + new user; ask: separate template chain
         │
         ▼
-common.terminate_expand_jobs()    ← optional; skipped when request_opts.cancel_existing_expand_jobs is false
-plenary.Job                       ← registered in common.expand_jobs with optional expand_session_id
+common.terminate_expand_jobs()    ← optional; per-session via terminate_expand_jobs_for_session(session_id)
+plenary.Job                       ← registered in common.expand_jobs with expand_session_id
         │
         ▼
-callback(single_string)           ← optional fences stripped in expand.lua; preview + accept/dismiss
+callback(single_string)           ← expand_parse.parse_response → merge → expand_inline_diff.render; review keymaps
 ```
 
 Each **shipped** backend module exposes `complete(context, callback, inline_opts?)`. Chat backends used for Expand also expose `expand_chat(...)` (see below). The inline `complete` callback receives a list of strings (candidates), or is called with no arguments on failure. Expand uses a separate code path and job list so it does not cancel inline completions and vice versa.
+
+---
+
+## Prompt float behaviour
+
+Both the implement prompt and the ask UI open as anchored **floats** near the selection.
+
+### Positioning
+
+Floats are placed **above** the selection when there is enough room. If the selection is too close to the top of the window, the float falls back to below the selection. When the source buffer window is not visible or the selection row is off-screen, the float is centred on the editor.
+
+`anchored_win_config(bufnr, sr, sc, width, height)` returns the `nvim_open_win` config table and the `row_off` value (distance from `vim.fn.line('w0')` to the selection start). `row_off` is `nil` for the editor-relative fallback.
+
+When the instruction float was opened **below** the selection (not enough rows above) and inline diff adds `virt_lines_above` extmarks on the selection, `reposition_prompt_after_diff()` shifts the float downward by the number of virtual lines so it does not sit on top of the diff preview. The source window is then centered on the selection (`normal! zz`). 
+
+### Dynamic height
+
+Prompt and ask UIs start at the minimum height needed for their initial content (typically 1 line). A `TextChanged` / `TextChangedI` autocmd recalculates the height as the user types, capped at the configured maximum (`expand.ui.prompt_height` for implement, `expand.ui.ask_height` for ask). Height updates go through `nvim_win_set_config` and the row is recalculated so the float stays above the selection.
+
+### Footers
+
+Float footers show key hints (e.g. `Enter submit · ^J newline · dismiss · focus_window`). Key labels for `dismiss` / `focus_window` use `utils.keymap_footer_label()`. `@file` / `@symbol` references are **not** shown in the footer — they are documented in the README and available in the instruction text.
+
+---
+
+## Ask session lifecycle
+
+Ask sessions are **non-blocking**: the user can hide the float and continue editing, then reopen it later.
+
+### Session fields
+
+`ExpandSession` carries these ask-specific fields:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `ask_buf` | `integer\|nil` | Buffer handle; persists across hide/show (`bufhidden = 'hide'`) |
+| `ask_win` | `integer\|nil` | Window handle; `nil` when hidden |
+| `ask_messages` | `table` | `{ role, content }` pairs — full conversation history (all turns sent to the model via `<conversationBlock>`) |
+| `ask_generating` | `boolean\|nil` | `true` while an HTTP request is in flight |
+| `ask_hidden` | `boolean\|nil` | `true` when the window was hidden by the user |
+| `ask_footer_default` | `string\|nil` | Footer / winbar hint text restored after generation completes |
+| `ask_resize_augroup` | `integer\|nil` | Augroup for the `TextChanged` resize autocmd |
+| `ui_layout` | `'float'\|nil` | Which chrome path is active for the ask UI |
+
+### Window vs session lifetime
+
+- `close_ask_ui(sess)` closes the ask UI window but **preserves the buffer**. Used by `M.ask_toggle()` when hiding.
+- `destroy_ask_ui(sess)` closes the window, deletes the resize augroup, wipes the buffer. Called from `destroy_session()`.
+
+### Keybinds inside the ask UI (and implement / revise prompts)
+
+| Key | Mode | Action |
+|---|---|---|
+| `<CR>` | n, i | Submit (send question or instruction) |
+| `<C-J>` | i | Insert a newline at the cursor |
+| `dismiss` | n, i | End the ask session (same as from the code buffer) |
+| `focus_window` | n | Toggle: jump out to the source buffer (when already in the expand UI) |
+
+`Esc` is not remapped in expand floats; it behaves as usual (e.g. leave insert mode).
+
+### Toggle (`M.ask_toggle()`)
+
+The `expand.keymap.ask` keybind is dual-purpose:
+
+1. If an active ask session exists with a **visible** window → hide it.
+2. If an active ask session exists but is **hidden** → reopen the float, reattach the persisted buffer, restore chrome based on generating state, place cursor at the end.
+3. If **no** ask session exists → invoke a new one (`M.invoke_ask()`).
+
+To jump into a hidden ask float without starting a new session, use **`expand.keymap.focus_window`** (`M.focus_nearest_window()`), which reopens the buffer in a float if needed. Returns `true` if an existing session was toggled, `false` otherwise.
+
+### Background generation
+
+When the user hides the ask float (via `ask_toggle`) while the model is generating:
+
+- The HTTP job continues; `on_done` accumulates the response into `sess.ask_messages`.
+- `on_done` does not move focus into the float; on a non-empty assistant reply it notifies with `phantom-code: ask response ready` (empty replies only get the existing warning).
+- When the user reopens via `ask_toggle` or `focus_nearest_window`, the transcript re-renders with the latest assistant response visible.
+
+### Ask buffer (`ask_render_transcript`)
+
+The buffer is set to `modifiable = true` before writing lines (except while a request is in flight, when it is set non-modifiable after rendering). The UI shows **one view at a time**—no section headers and no full transcript:
+
+- **No messages:** a single empty line for the first question.
+- **While awaiting a reply:** one line, `Waiting for reply…` (submit is ignored for that text).
+- **Otherwise:** the body of the **last** entry in `sess.ask_messages` only—typically the latest assistant reply; if the model returned empty, the last user message is shown again so the user can edit and resend.
+
+On submit, the **entire buffer** (trimmed) is taken as the user question (unless empty or the waiting placeholder). Full history remains in `sess.ask_messages` for `<conversationBlock>` in the ask template.
 
 ---
 
@@ -91,7 +187,14 @@ For **inline** `complete()`, they:
 
 The model's response is a single string containing one or more candidates separated by `<endCompletion>`. `common.parse_completion_items` splits on this delimiter.
 
-For **Expand**, the same HTTP stack is used via `expand_chat`, but the message list is built only from `expand.system`, `expand.user_template` / `expand.few_shots`, and the selection context — not from `chat_input` or inline `few_shots`. The response is a single assistant string (no `<endCompletion>` splitting).
+For **Expand (implement)**, the same HTTP stack is used via `expand_chat`. The message list is:
+
+- Claude path: `expand.few_shots` (if any) + **stored `implement_messages`** (alternating user/assistant from prior successful turns) + the new user turn built from `expand.user_template` (after `expand_context_refs` and `fill_user_template`).
+- OpenAI-shaped path: `system` + `few_shots` + **`implement_messages`** + new user message.
+
+`expand.system_generate` is used when the selection text is empty (generate-at-cursor). The assistant reply is a single string, parsed by `expand_parse.parse_response` (XML `<phantom_expand>` with `<replacement>` and/or `<edit>`; fallback to raw text). **Ask mode** uses `expand.system_ask` and `expand.user_template_ask` with `ask_messages`; it does not use `implement_messages`.
+
+The response is not split on `<endCompletion>` (that delimiter is inline-only).
 
 **Context ordering:** Claude and the default `openai_compatible` config send context in the order `<contextAfterCursor>` then `<contextBeforeCursor>` (suffix-first). OpenAI and Gemini use prefix-first ordering. This is controlled by which `system` / `chat_input` / `few_shots` table is selected — the `_prefix_first` variants vs the plain defaults. The reason for suffix-first ordering with Claude is that it tends to produce higher-quality completions when the model "reads" the surrounding code before the prefix.
 
@@ -274,7 +377,13 @@ require('phantom-code').setup({
 
 ## Context enrichment
 
-`inline.context_enrich` is a free-form escape hatch called after all built-in context processing (inline completions only). Return a new context table to replace it, or return `nil` to leave it unchanged.
+Order inside `utils.enrich_llm_context` (inline):
+
+1. `apply_diagnostics_context` — fills `opts.diagnostics_context`.
+2. **`context.attach_import_snippets`** — if `inline.import_context.enable ~= false`, prepends `<importedFile path="…">` blocks to `lines_before` (Lua `require`, JS/TS relative `import`; see `lua/phantom-code/context.lua`).
+3. **`inline.context_enrich`** — if this function returns a **new** table, that table replaces the context entirely (import + diagnostics work on the original table only if you replace early).
+
+`inline.context_enrich` is a free-form escape hatch. Return a new context table to replace the current one, or return `nil` to leave it unchanged.
 
 ```lua
 require('phantom-code').setup({
@@ -470,6 +579,10 @@ Use this to pair `openai_fim_compatible` for inline ghost text with `openai_comp
 
 Expand `expand_chat` / `expand_openai_chat` accept `request_opts.cancel_existing_expand_jobs` (default true) and `request_opts.expand_session_id`. When `expand.cancel_inflight` is false, `expand.lua` passes `cancel_existing_expand_jobs = false` so multiple `curl` jobs can run; dismissing a single preview terminates only that session’s jobs.
 
+While `state == 'generating'`, the same **dismiss** keymap as in review is bound on the source buffer (`generating_keymaps`) and calls `M.dismiss` → `terminate_expand_jobs_for_session` + session teardown.
+
+After each successful implement response, `implement_messages` gains a user + assistant pair; `trim_implement_messages` drops oldest **pairs** when `expand.max_conversation_messages` is exceeded (`0` disables trimming).
+
 ---
 
 ## `complete` vs `expand_chat`
@@ -477,8 +590,8 @@ Expand `expand_chat` / `expand_openai_chat` accept `request_opts.cancel_existing
 | | `complete(context, callback, inline_opts?)` | `expand_chat(...)` |
 |---|---|---|
 | **Used by** | Virtual text, blink | `expand.lua` only |
-| **Messages** | System from `make_system_prompt`, inline `few_shots`, `chat_input` user turn | `expand.system` string + user body from `expand.user_template`; optional `expand.few_shots` |
-| **Output** | List of candidates (`<endCompletion>` split) | Single string |
+| **Messages** | System from `make_system_prompt`, inline `few_shots`, `chat_input` user turn | Implement: `expand.system` (or `system_generate` if empty selection) + `expand.few_shots` + **`implement_messages`** + templated user message. Ask: `system_ask` + ask template + `ask_messages`. |
+| **Output** | List of candidates (`<endCompletion>` split) | Single string (XML or fallback plain replacement) |
 | **Job pool** | Inline (default) | Always `expand` |
 | **OpenAI-shaped APIs** | `openai_base.complete_openai_base` | `openai_base.expand_openai_chat` |
 | **Claude** | `claude.complete` | `claude.expand_chat(system_text, messages, ...)` — top-level `system` field |
@@ -491,16 +604,20 @@ Expand `expand_chat` / `expand_openai_chat` accept `request_opts.cancel_existing
 
 ```
 lua/phantom-code/
-├── init.lua            Setup, commands, change_model/provider, :PhantomCode expand
-├── config.lua          Default config, inline/expand blocks, prompts
-├── virtualtext.lua     Ghost text rendering, autocmds, action functions
-├── blink.lua           blink-cmp source protocol implementation
-├── expand.lua          Visual selection → instruction → expand_chat → preview/accept
-├── utils.lua           Context, diagnostics formatting, resolve_provider_config, expand surround, curl args
-├── modelcard.lua       Known models per provider (used for :PhantomCode change_model tab-complete)
-├── deprecate.lua       One-time breaking-change notification helper
+├── init.lua                 Setup, commands, change_model/provider
+├── config.lua               Default config, inline/expand blocks, prompts (incl. ask + generate)
+├── virtualtext.lua          Ghost text; CursorMovedI throttled schedule + debounced trigger
+├── blink.lua                blink-cmp source; disabled when virtual-text auto is on for buffer
+├── context.lua              Import resolution + import_context snippets for enrich_llm_context
+├── expand.lua               Sessions, prompt floats, implement + ask, generating/review keymaps
+├── expand_parse.lua         Parse <phantom_expand> / <edit> / <replacement>
+├── expand_inline_diff.lua   Namespace extmarks for diff overlay on selection
+├── expand_context_refs.lua  @file / @symbol resolution for expand instructions
+├── utils.lua                Context, diagnostics, should_skip_inline_request, enrich_llm_context, expand surround
+├── modelcard.lua            Known models per provider (change_model tab-complete)
+├── deprecate.lua            Breaking-change notification helper
 └── backends/
-    ├── common.lua              Job pools, transform application, item parsing
+    ├── common.lua              Job pools, transform application, item parsing, per-session expand cancel
     ├── claude.lua              Anthropic API: complete + expand_chat
     ├── openai.lua              OpenAI API: complete + expand_chat
     ├── openai_base.lua         Shared OpenAI chat + FIM + expand_openai_chat
