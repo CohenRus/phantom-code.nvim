@@ -1,16 +1,17 @@
 local M = {}
 
 function M.setup(config)
+    local cfg = config or {}
     local default_config = require 'phantom-code.config'
 
-    if config.enabled then
+    if cfg.enabled then
         vim.deprecate('phantom-code.config.enabled', 'phantom-code.config.inline.enable_predicates', 'next release', 'phantom-code', false)
-        config.inline = vim.tbl_deep_extend('force', config.inline or {}, {
-            enable_predicates = (config.inline and config.inline.enable_predicates) or config.enabled,
+        cfg.inline = vim.tbl_deep_extend('force', cfg.inline or {}, {
+            enable_predicates = (cfg.inline and cfg.inline.enable_predicates) or cfg.enabled,
         })
     end
 
-    M.config = vim.tbl_deep_extend('force', default_config, config or {})
+    M.config = vim.tbl_deep_extend('force', default_config, cfg)
 
     require('phantom-code.virtualtext').setup()
     require('phantom-code.expand').setup()
@@ -118,7 +119,12 @@ local function phantom_code_complete(arglead, cmdline, _)
     end
 
     local completions = {
-        expand = true,
+        expand = {
+            ask = true,
+            accept = true,
+            dismiss = true,
+            revise = true,
+        },
         blink = { enable = true, disable = true, toggle = true },
         virtualtext = { enable = true, disable = true, toggle = true },
         change_model = complete_change_model_options,
@@ -165,6 +171,7 @@ local function phantom_code_complete(arglead, cmdline, _)
     return {}
 end
 
+pcall(vim.api.nvim_del_user_command, 'PhantomCode')
 vim.api.nvim_create_user_command('PhantomCode', function(args)
     if not M.config then
         vim.notify 'PhantomCode config is not set up yet, please call the setup function firstly.'
@@ -209,7 +216,21 @@ vim.api.nvim_create_user_command('PhantomCode', function(args)
     if command == 'change_model' then
         M.change_model(fargs[2])
     elseif command == 'expand' then
-        require('phantom-code.expand').invoke()
+        local sub = fargs[2]
+        local ex = require 'phantom-code.expand'
+        if sub == 'ask' then
+            ex.invoke_ask()
+        elseif sub == 'accept' then
+            ex.accept()
+        elseif sub == 'dismiss' then
+            ex.dismiss()
+        elseif sub == 'revise' then
+            ex.revise()
+        elseif sub == nil or sub == '' then
+            ex.invoke()
+        else
+            vim.notify('PhantomCode expand: unknown subcommand ' .. tostring(sub), vim.log.levels.ERROR)
+        end
     else
         local action_group = actions[command]
         if not action_group then

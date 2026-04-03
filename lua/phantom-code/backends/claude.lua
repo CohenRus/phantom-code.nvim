@@ -142,7 +142,12 @@ M.complete = function(context, callback, inline_opts)
     local ctx = utils.make_chat_llm_shot(context, options.chat_input)
     ctx = common.create_chat_messages_from_list(ctx)
 
-    local few_shots = vim.deepcopy(utils.get_or_eval_value(options.few_shots))
+    local few_shots = utils.get_or_eval_value(options.few_shots)
+    if type(few_shots) ~= 'table' then
+        few_shots = {}
+    else
+        few_shots = vim.deepcopy(few_shots)
+    end
 
     vim.list_extend(few_shots, ctx)
 

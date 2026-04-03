@@ -5,11 +5,14 @@ if vim.tbl_isempty(vim.api.nvim_get_hl(0, { name = 'BlinkCmpItemKindPhantomCode'
     vim.api.nvim_set_hl(0, 'BlinkCmpItemKindPhantomCode', { link = 'BlinkCmpItemKind' })
 end
 
-function M.get_trigger_characters()
-    return { '@', '.', '(', '[', ':', '{' }
-end
-
 function M:enabled()
+    if vim.b.phantom_code_expand_prompt then
+        return false
+    end
+    -- Virtual-text auto-trigger and blink phantom source are mutually exclusive for this buffer.
+    if utils.virtual_text_auto_active() then
+        return false
+    end
     local config = require('phantom-code').config
     local resolved = utils.resolve_provider_config 'inline'
     if not utils.get_api_key(resolved.options.api_key) then
@@ -45,6 +48,12 @@ function M:get_completions(ctx, callback)
             return
         end
 
+        local cmp_ctx = utils.make_cmp_context(ctx)
+        if not_manual_completion and utils.should_skip_inline_request(cmp_ctx) then
+            callback()
+            return
+        end
+
         -- NOTE: blink will accumulate completion items during multiple
         -- callbacks, So for each back we must ensure we only deliver new
         -- arrived completion items to avoid duplicated completion items.
@@ -57,7 +66,6 @@ function M:get_completions(ctx, callback)
             end, config.inline.throttle)
         end
 
-        local cmp_ctx = utils.make_cmp_context(ctx)
         local context = utils.enrich_llm_context(utils.get_context(cmp_ctx), cmp_ctx)
         utils.notify('PhantomCode completion started', 'verbose')
 

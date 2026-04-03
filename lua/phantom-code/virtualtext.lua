@@ -20,37 +20,41 @@ local internal = {
     context = {},
     is_on_throttle = false,
     current_completion_timestamp = 0,
+    last_cursor_moved_schedule_ms = 0,
 }
 
 local function should_auto_trigger()
     return vim.b.phantom_code_virtual_text_auto_trigger
 end
 
+local has_cmp, cmp = pcall(require, 'cmp')
+if not has_cmp then
+    cmp = nil
+end
+
+local has_blink, blink = pcall(require, 'blink.cmp')
+if not has_blink then
+    blink = nil
+end
+
 local function completion_menu_visible()
-    local has_cmp = pcall(require, 'cmp')
-    local cmp_visible = false
-
-    local has_blink = pcall(require, 'blink.cmp')
-    local blink_visible = false
-
-    if has_cmp then
-        local ok, _cmp_visible = pcall(function()
-            return require('cmp').core.view:visible()
-        end)
-
-        if ok then
-            cmp_visible = _cmp_visible
-        end
+    if not has_cmp and package.loaded.cmp then
+        has_cmp, cmp = pcall(require, 'cmp')
+    end
+    if not has_blink and package.loaded['blink.cmp'] then
+        has_blink, blink = pcall(require, 'blink.cmp')
     end
 
-    if has_blink then
-        local ok, _blink_visible = pcall(function()
-            return require('blink.cmp').is_visible()
-        end)
+    local cmp_visible = false
+    if has_cmp and cmp and cmp.core and cmp.core.view and cmp.core.view.visible then
+        local ok, visible = pcall(cmp.core.view.visible, cmp.core.view)
+        cmp_visible = ok and visible or false
+    end
 
-        if ok then
-            blink_visible = _blink_visible
-        end
+    local blink_visible = false
+    if has_blink and blink and blink.is_visible then
+        local ok, visible = pcall(blink.is_visible)
+        blink_visible = ok and visible or false
     end
 
     return vim.fn.pumvisible() == 1 or cmp_visible or blink_visible
@@ -100,6 +104,7 @@ end
 ---@field choice? integer
 ---@field shown_choices? table<string, true>
 ---@field last_pos integer[]
+---@field preview_anchor? integer[] 0-based row, byte col where inline preview is anchored (for accept)
 
 ---@param ctx phantom-code.VirtualtextSuggestionContext
 local function reset_ctx(ctx)
@@ -107,6 +112,7 @@ local function reset_ctx(ctx)
     ctx.choice = nil
     ctx.shown_choices = nil
     ctx.last_pos = nil
+    ctx.preview_anchor = nil
 end
 
 local function stop_timer()
@@ -117,8 +123,10 @@ local function stop_timer()
     end
 end
 
-local function clear_preview()
-    api.nvim_buf_del_extmark(0, internal.ns_id, internal.extmark_id)
+---@param bufnr? integer
+local function clear_preview(bufnr)
+    bufnr = bufnr or api.nvim_get_current_buf()
+    pcall(api.nvim_buf_del_extmark, bufnr, internal.ns_id, internal.extmark_id)
 end
 
 ---@param ctx? phantom-code.VirtualtextSuggestionContext
@@ -146,10 +154,14 @@ end
 local function update_preview(ctx)
     ctx = ctx or get_ctx()
 
+    if utils.is_expand_prompt_buffer() then
+        return
+    end
+
     local suggestion = get_current_suggestion(ctx)
     local display_lines = suggestion and vim.split(suggestion, '\n', { plain = true }) or {}
 
-    clear_preview()
+    clear_preview(api.nvim_get_current_buf())
 
     local show_on_completion_menu = require('phantom-code').config.inline.virtualtext.show_on_completion_menu
 
@@ -186,21 +198,31 @@ local function update_preview(ctx)
 
     extmark.hl_mode = 'replace'
 
-    api.nvim_buf_set_extmark(0, internal.ns_id, cursor_line - 1, cursor_col - 1, extmark)
+    local row0, col0 = cursor_line - 1, cursor_col - 1
+    api.nvim_buf_set_extmark(0, internal.ns_id, row0, col0, extmark)
 
     if not ctx.shown_choices[suggestion] then
         ctx.shown_choices[suggestion] = true
     end
 
     ctx.last_pos = api.nvim_win_get_cursor(0)
+    ctx.preview_anchor = { row0, col0 }
 end
 
----@param ctx? phantom-code.VirtualtextSuggestionContext
-local function cleanup(ctx)
-    ctx = ctx or get_ctx()
+---@param bufnr? integer defaults to current buffer
+---@param opts? { cancel_jobs?: boolean }
+local function cleanup(bufnr, opts)
+    opts = opts or {}
+    bufnr = bufnr or api.nvim_get_current_buf()
+    local ctx = get_ctx(bufnr)
     stop_timer()
     reset_ctx(ctx)
-    clear_preview()
+    clear_preview(bufnr)
+    -- Invalidate pending callbacks started before this cleanup.
+    internal.current_completion_timestamp = math.max(uv.now(), internal.current_completion_timestamp + 1)
+    if opts.cancel_jobs then
+        require('phantom-code.backends.common').terminate_all_jobs()
+    end
 end
 
 ---@param ctx phantom-code.VirtualtextSuggestionContext
@@ -235,6 +257,10 @@ end
 
 local function trigger(bufnr)
     if bufnr ~= api.nvim_get_current_buf() or vim.fn.mode() ~= 'i' then
+        return
+    end
+
+    if utils.is_expand_prompt_buffer(bufnr) then
         return
     end
 
@@ -345,14 +371,22 @@ local function schedule()
 
     local config = require('phantom-code').config
     local bufnr = api.nvim_get_current_buf()
+    if utils.is_expand_prompt_buffer(bufnr) then
+        return
+    end
 
     internal.timer = vim.defer_fn(function()
+        if utils.is_expand_prompt_buffer(api.nvim_get_current_buf()) then
+            return
+        end
         local show_on_completion_menu = require('phantom-code').config.inline.virtualtext.show_on_completion_menu
 
+        local cmp_ctx_gate = utils.make_cmp_context()
         if
             internal.is_on_throttle
             or (not show_on_completion_menu and completion_menu_visible())
             or (not utils.run_hooks_until_failure(config.inline.enable_predicates))
+            or utils.should_skip_inline_request(cmp_ctx_gate)
         then
             return
         end
@@ -366,9 +400,28 @@ local function schedule()
     end, config.inline.debounce)
 end
 
+--- Rate-limit CursorMovedI-driven scheduling (typing); does not wrap InsertEnter.
+local function throttled_schedule()
+    local config = require('phantom-code').config
+    local ms = config.inline.cursor_moved_throttle_ms or 0
+    if ms <= 0 then
+        schedule()
+        return
+    end
+    local now = uv.now()
+    if now - internal.last_cursor_moved_schedule_ms < ms then
+        return
+    end
+    internal.last_cursor_moved_schedule_ms = now
+    schedule()
+end
+
 local action = {}
 
 action.next = function()
+    if utils.is_expand_prompt_buffer() then
+        return
+    end
     local ctx = get_ctx()
 
     -- no suggestion request yet
@@ -381,6 +434,9 @@ action.next = function()
 end
 
 action.prev = function()
+    if utils.is_expand_prompt_buffer() then
+        return
+    end
     local ctx = get_ctx()
 
     -- no suggestion request yet
@@ -397,6 +453,9 @@ end
 ---If n_lines is provided, only the first n_lines of the suggestion are inserted.
 ---After insertion, moves the cursor to the end of the inserted text.
 function action.accept(n_lines)
+    if utils.is_expand_prompt_buffer() then
+        return
+    end
     local ctx = get_ctx()
 
     local suggestion = get_current_suggestion(ctx)
@@ -427,16 +486,28 @@ function action.accept(n_lines)
         reset_ctx(ctx)
     end
 
-    clear_preview()
-
-    local cursor = api.nvim_win_get_cursor(0)
-    local line, col = cursor[1] - 1, cursor[2]
     local bufnr = api.nvim_get_current_buf()
+    local ext = api.nvim_buf_get_extmark_by_id(bufnr, internal.ns_id, internal.extmark_id, {})
+    local line, col
+    if ext[1] ~= nil and ext[2] ~= nil then
+        line, col = ext[1], ext[2]
+    elseif ctx.preview_anchor then
+        line, col = ctx.preview_anchor[1], ctx.preview_anchor[2]
+    else
+        local cursor = api.nvim_win_get_cursor(0)
+        line, col = cursor[1] - 1, cursor[2]
+    end
+
+    clear_preview(bufnr)
+
     local row_line = api.nvim_buf_get_lines(bufnr, line, line + 1, false)[1] or ''
     local before_part = vim.fn.strcharpart(row_line, 0, col)
     local after_part = vim.fn.strcharpart(row_line, col, vim.fn.strchars(row_line) - col)
 
     vim.schedule(function()
+        if not api.nvim_buf_is_valid(bufnr) then
+            return
+        end
         if #suggestions > 0 and require('phantom-code').config.inline.normalize_on_accept ~= false then
             suggestions[1] = utils.normalize_inline_accept_suggestion(before_part, after_part, suggestions[1], {
                 bufnr = bufnr,
@@ -444,18 +515,21 @@ function action.accept(n_lines)
                 col0_byte = col,
             })
         end
-        api.nvim_buf_set_text(0, line, col, line, col, suggestions)
+        api.nvim_buf_set_text(bufnr, line, col, line, col, suggestions)
         local new_col = #suggestions[#suggestions]
-        -- For single-line suggestions, adjust the column position by adding the
-        -- current column offset
         if #suggestions == 1 then
             new_col = new_col + col
         end
-        api.nvim_win_set_cursor(0, { line + #suggestions, new_col })
+        if api.nvim_win_get_buf(0) == bufnr then
+            api.nvim_win_set_cursor(0, { line + #suggestions, new_col })
+        end
     end)
 end
 
 function action.accept_n_lines()
+    if utils.is_expand_prompt_buffer() then
+        return
+    end
     local cursor_pos = vim.api.nvim_win_get_cursor(0)
     local n = vim.fn.input 'accept n lines: '
 
@@ -481,8 +555,7 @@ function action.accept_line()
 end
 
 function action.dismiss()
-    local ctx = get_ctx()
-    cleanup(ctx)
+    cleanup(nil, { cancel_jobs = true })
 end
 
 function action.is_visible()
@@ -516,12 +589,22 @@ function autocmd.on_insert_leave()
 end
 
 function autocmd.on_buf_leave()
-    if vim.fn.mode():match '^[iR]' then
-        autocmd.on_insert_leave()
+    if not vim.fn.mode():match '^[iR]' then
+        return
     end
+    local leaving_buf = api.nvim_get_current_buf()
+    vim.schedule(function()
+        if utils.is_expand_prompt_buffer(api.nvim_get_current_buf()) then
+            return
+        end
+        cleanup(leaving_buf)
+    end)
 end
 
 function autocmd.on_insert_enter()
+    if utils.is_expand_prompt_buffer() then
+        return
+    end
     if should_auto_trigger() then
         schedule()
     end
@@ -534,19 +617,18 @@ function autocmd.on_buf_enter()
 end
 
 function autocmd.on_cursor_moved_i()
+    if utils.is_expand_prompt_buffer() then
+        cleanup()
+        return
+    end
     local ctx = get_ctx()
 
     if update_suggestion_on_typing(ctx) then
         return
     end
 
-    -- we don't cleanup immediately if the completion has arrived but not
-    -- display yet.
-    if ctx.shown_choices and next(ctx.shown_choices) then
-        cleanup(ctx)
-    end
     if should_auto_trigger() then
-        schedule()
+        throttled_schedule()
     end
 end
 
@@ -554,8 +636,12 @@ function autocmd.on_cursor_hold_i()
     update_preview()
 end
 
+-- TextChangedP only runs with the completion popup visible; CursorMovedI already
+-- runs on normal insert typing — avoid doubling work every keystroke.
 function autocmd.on_text_changed_p()
-    autocmd.on_cursor_moved_i()
+    if completion_menu_visible() then
+        autocmd.on_cursor_moved_i()
+    end
 end
 
 ---@param info { buf: integer }

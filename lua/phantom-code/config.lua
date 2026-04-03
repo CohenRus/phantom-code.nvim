@@ -93,15 +93,37 @@ const processedData = transformData(rawData, {
 
 local n_completion_template = '8. Provide at most %d completion items.'
 
-local default_expand_system = [[You are a precise coding assistant. The user selected code in their editor and gave an instruction.
-Output only the replacement code (or generated code that should replace the selection). Do not wrap the answer in markdown fences unless the file already uses that pattern. No explanations or preamble.
-Do NOT echo or repeat the selected code before your replacement. Output only the replacement, exactly once.
+local default_expand_system = [[You are a precise coding assistant. The user selected code and gave an instruction.
 
-If the selection already includes a declaration or signature with an empty block (e.g. `int foo() { }`), output either (a) only the new statements that belong inside the braces, or (b) the full corrected snippet that should replace the entire selection — do not duplicate the same declaration before the body. Prefer (a) when the scaffolding is already correct.]]
+Respond ONLY with a single XML document (no markdown fences, no preamble) of this shape:
+
+<phantom_expand>
+  <!-- Option A — replace the entire selection: -->
+  <replacement>...full new text for the selection...</replacement>
+
+  <!-- Option B — one or more edits inside the selection (line numbers are 1-based; line 1 = first line of the selection): -->
+  <!-- <edit startLine="2" endLine="4">new lines replacing those lines</edit> -->
+
+  Use Option B when several localized changes are clearer than one big replacement. You may use multiple <edit> elements; they must not overlap. Prefer Option A for small selections or full rewrites.
+
+  Do not echo the original selected code outside the tags. No explanations outside the XML.
+]]
+
+local default_expand_system_generate = [[You are a precise coding assistant. The user wants new code inserted at the cursor (there may be no selected text).
+
+Respond ONLY with a single XML document (no markdown fences, no preamble) of this shape:
+
+<phantom_expand>
+  <replacement>...code to insert at the cursor...</replacement>
+</phantom_expand>
+
+Prefer concise, idiomatic code that fits the surrounding file. No explanations outside the XML.
+]]
 
 local default_expand_user_template = [[File: <filePath>
 Language: <fileType>
 
+<referencedContextBlock>
 Instruction:
 <instruction>
 
@@ -114,6 +136,26 @@ Context before selection:
 Context after selection:
 <fileContextAfter>
 <diagnosticsBlock>]]
+
+local default_expand_system_ask = [[You are a helpful coding assistant. Answer clearly and concisely. You may use short markdown (fenced code blocks) when showing examples. Do not invent file paths or APIs not implied by the context.]]
+
+local default_expand_user_template_ask = [[File: <filePath>
+Language: <fileType>
+
+Selected code:
+<selectedCode>
+
+Context before selection:
+<fileContextBefore>
+
+Context after selection:
+<fileContextAfter>
+<diagnosticsBlock>
+
+<conversationBlock>
+
+Current question:
+<question>]]
 
 -- use {{{ and }}} to wrap placeholders, which will be further processesed in other function
 local default_system_template = '{{{prompt}}}\n{{{guidelines}}}\n{{{n_completion_template}}}'
@@ -202,12 +244,13 @@ local M = {
     --- Inline Tab completion (virtual text, blink-cmp): UI, timing, prompts, provider overrides. Not used by Expand.
     inline = {
         blink = {
+            -- When `virtualtext.auto_trigger_ft` sets `vim.b.phantom_code_virtual_text_auto_trigger`
+            -- for a buffer, the blink.cmp phantom source is disabled there (mutually exclusive auto inline).
             enable_auto_complete = true,
         },
         virtualtext = {
-            -- Specify the filetypes to enable automatic virtual text completion,
-            -- e.g., { 'python', 'lua' }. Note that you can still invoke manual
-            -- completion even if the filetype is not on your auto_trigger_ft list.
+            -- Filetypes that enable automatic ghost text on the buffer. When active, blink’s
+            -- phantom-code source does not run on that buffer (use virtual text keymaps or blink elsewhere).
             auto_trigger_ft = {},
             -- specify file types where automatic virtual text completion should be
             -- disabled. This option is useful when auto-completion is enabled for
@@ -233,9 +276,23 @@ local M = {
         prompt_overrides = {},
         --- If set, truncate each completion to at most this many lines (virtual text only).
         max_lines = nil,
-        throttle = 1000, -- only send the request every x milliseconds, use 0 to disable throttle.
+        throttle = 500, -- only send the request every x milliseconds, use 0 to disable throttle.
         -- debounce the request in x milliseconds, set 0 to disable debounce
-        debounce = 400,
+        debounce = 150,
+        --- Minimum milliseconds between CursorMovedI-driven schedule() calls (0 = no extra throttle).
+        cursor_moved_throttle_ms = 50,
+        --- Optional cost-saving gates (all off by default). Does not skip comments/strings.
+        request_gating = {
+            --- When true, skip auto inline request if current and previous lines are both empty/whitespace.
+            skip_consecutive_empty_lines = false,
+        },
+        --- Resolve imports and attach snippets from imported files to inline LLM context.
+        import_context = {
+            enable = true,
+            max_chars = 4000,
+            max_files = 3,
+            max_imports_scanned = 64,
+        },
         -- If completion item has multiple lines, create another completion item
         -- only containing its first line. This option only has impact for cmp and
         -- blink. For virtualtext, no single line entry will be added.
@@ -276,7 +333,13 @@ local M = {
         provider = nil,
         provider_options = {},
         system = default_expand_system,
+        --- Used when Expand is invoked with an empty selection (cursor-only / generate mode).
+        system_generate = default_expand_system_generate,
         user_template = default_expand_user_template,
+        --- Strip/inject `@file:` and `@symbol:` in the instruction; total budget for referenced bodies.
+        max_reference_chars = 8000,
+        --- Max stored user+assistant pairs for implement revise (default 16 messages = 8 rounds). 0 = unlimited.
+        max_conversation_messages = 16,
         few_shots = nil,
         --- Deep-merge over top-level `diagnostics` for Expand only.
         diagnostics = {},
@@ -291,13 +354,38 @@ local M = {
         merge = true,
         --- Optional `function(selected, response, { bufnr, start_row }) return string end` overrides built-in merge.
         merge_fn = nil,
+        --- Legacy: implement flow always uses inline diff on the buffer; this is ignored for new UI.
         preview = 'inline_extmark',
-        --- `'float'` (default): centered float like preview. `'input'`: `vim.ui.input` on cmdline.
+        --- `'float'`: anchored multi-line prompt. `'input'`: `vim.ui.input` on cmdline.
         prompt_ui = 'float',
+        --- Ask mode: separate system and user template (`<question>`, `<conversationBlock>`, same context placeholders as expand).
+        system_ask = default_expand_system_ask,
+        user_template_ask = default_expand_user_template_ask,
+        --- Float popup anchored near the selection (`relative = win` when visible).
+        ui = {
+            prompt_height = 10,
+            prompt_width = 72,
+            ask_height = 16,
+            ask_width = 80,
+            --- End-of-line virtual text on the selection row when expand UI is collapsed via `toggle_window` (empty string disables).
+            collapsed_marker = ' ⋯ expand',
+        },
+        --- Inline diff highlights (implemented in expand_inline_diff.lua).
+        inline_diff = {
+            enable = true,
+        },
         keymap = {
             invoke = nil,
+            ask = nil,
             accept = nil,
+            --- Same as `accept` but not buffer-local; works from any window while in review (optional).
+            accept_global = nil,
             dismiss = nil,
+            revise = nil,
+            --- Toggle focus between code buffer and nearest expand window.
+            focus_window = nil,
+            --- Hide or show the expand float (ask session or pinned implement prompt after submit).
+            toggle_window = nil,
         },
     },
     -- Must match `lua/phantom-code/backends/<name>.lua` (codestral/gemini have no module in-repo).
